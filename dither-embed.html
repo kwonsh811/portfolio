@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Dither Ripple</title>
+<style>
+  html,body{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#000; }
+  #c{ display:block; width:100%; height:100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+  /* ──────────────────────────────────────────────
+     Dither Ripple — 프레이머 Embed(iframe)용 단일 파일
+     React / 외부 패키지 없이 순수 WebGL 로 동작.
+
+     색·속도 등은 아래 CONFIG 에서 바꾸거나,
+     iframe URL 뒤에 쿼리로 덮어쓸 수 있음:
+       ?r=0.5&g=0.4&b=1.0&speed=0.05&pixel=2&colors=4
+  ────────────────────────────────────────────── */
+  const q = new URLSearchParams(location.search);
+  const num = (k, d) => q.has(k) ? parseFloat(q.get(k)) : d;
+
+  const CONFIG = {
+    waveColor:      [ num('r', 0.55), num('g', 0.42), num('b', 1.0) ], // 파장/물결 색 (RGB 0~1)
+    waveSpeed:      num('speed', 0.045),   // 배경 물결 흐르는 속도
+    waveFrequency:  num('freq', 3.0),      // 물결 패턴 주파수
+    waveAmplitude:  num('amp', 0.3),       // 물결 진폭
+    colorNum:       num('colors', 4.0),    // 디더링 색 단계 수
+    pixelSize:      num('pixel', 2.0),     // 도트 크기 (클수록 거친 픽셀)
+    mouseRadius:    num('mradius', 0.0),   // 커서 주변 음영 반경 (0이면 끔)
+    rippleSpeed:    num('rspeed', 0.5),    // 파장 퍼지는 속도
+    rippleStrength: num('rstrength', 1.0), // 파장 출렁임 세기
+    ambient:        q.get('ambient') !== '0' // 가끔 저절로 생기는 잔잔한 파장
+  };
+
+  const MAX = 10;
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl', { antialias:true, preserveDrawingBuffer:false });
+  if(!gl){ document.body.style.background = '#0a0a12'; return; }
+
+  const VERT = `
+    attribute vec2 aPos;
+    void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }
+  `;
+
+  const FRAG = `
+    precision highp float;
+    uniform vec2  resolution;
+    uniform float time;
+    uniform float waveSpeed, waveFrequency, waveAmplitude;
+    uniform vec3  waveColor;
+    uniform float colorNum, pixelSize, mouseRadius;
+    uniform vec2  mousePos;
+    uniform vec4  ripples[${MAX}];      /* x,y(px), 시작시각, 세기 */
+    uniform float rippleSpeed, rippleStrength;
+
+    vec4 mod289(vec4 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+    vec4 permute(vec4 x){ return mod289(((x * 34.0) + 1.0) * x); }
+    vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+    vec2 fade(vec2 t){ return t*t*t*(t*(t*6.0-15.0)+10.0); }
+
+    float cnoise(vec2 P){
+      vec4 Pi = floor(P.xyxy) + vec4(0.0,0.0,1.0,1.0);
+      vec4 Pf = fract(P.xyxy) - vec4(0.0,0.0,1.0,1.0);
+      Pi = mod289(Pi);
+      vec4 ix = Pi.xzxz, iy = Pi.yyww, fx = Pf.xzxz, fy = Pf.yyww;
+      vec4 i = permute(permute(ix) + iy);
+      vec4 gx = fract(i * (1.0/41.0)) * 2.0 - 1.0;
+      vec4 gy = abs(gx) - 0.5;
+      vec4 tx = floor(gx + 0.5);
+      gx = gx - tx;
+      vec2 g00 = vec2(gx.x, gy.x), g10 = vec2(gx.y, gy.y);
+      vec2 g01 = vec2(gx.z, gy.z), g11 = vec2(gx.w, gy.w);
+      vec4 norm = taylorInvSqrt(vec4(dot(g00,g00), dot(g01,g01), dot(g10,g10), dot(g11,g11)));
+      g00 *= norm.x; g01 *= norm.y; g10 *= norm.z; g11 *= norm.w;
+      float n00 = dot(g00, vec2(fx.x, fy.x));
+      float n10 = dot(g10, vec2(fx.y, fy.y));
+      float n01 = dot(g01, vec2(fx.z, fy.z));
+      float n11 = dot(g11, vec2(fx.w, fy.w));
+      vec2 fade_xy = fade(Pf.xy);
+      vec2 n_x = mix(vec2(n00, n01), vec2(n10, n11), fade_xy.x);
+      return 2.3 * mix(n_x.x, n_x.y, fade_xy.y);
+    }
+
+    const int OCT = 4;
+    float fbm(vec2 p){
+      float v = 0.0, amp = 1.0, freq = waveFrequency;
+      for(int i = 0; i < OCT; i++){
+        v += amp * abs(cnoise(p));
+        p *= freq; amp *= waveAmplitude;
+      }
+      return v;
+    }
+    float pattern(vec2 p){
+      vec2 p2 = p - time * waveSpeed;
+      return fbm(p + fbm(p2));
+    }
+    vec2 toShader(vec2 px){
+      vec2 ndc = (px / resolution - 0.5) * vec2(1.0, -1.0);
+      ndc.x *= resolution.x / resolution.y;
+      return ndc;
+    }
+
+    /* 8x8 Bayer 디더 */
+    float bayer(vec2 c){
+      float m[64];
+      m[0]=0.0;m[1]=48.0;m[2]=12.0;m[3]=60.0;m[4]=3.0;m[5]=51.0;m[6]=15.0;m[7]=63.0;
+      m[8]=32.0;m[9]=16.0;m[10]=44.0;m[11]=28.0;m[12]=35.0;m[13]=19.0;m[14]=47.0;m[15]=31.0;
+      m[16]=8.0;m[17]=56.0;m[18]=4.0;m[19]=52.0;m[20]=11.0;m[21]=59.0;m[22]=7.0;m[23]=55.0;
+      m[24]=40.0;m[25]=24.0;m[26]=36.0;m[27]=20.0;m[28]=43.0;m[29]=27.0;m[30]=39.0;m[31]=23.0;
+      m[32]=2.0;m[33]=50.0;m[34]=14.0;m[35]=62.0;m[36]=1.0;m[37]=49.0;m[38]=13.0;m[39]=61.0;
+      m[40]=34.0;m[41]=18.0;m[42]=46.0;m[43]=30.0;m[44]=33.0;m[45]=17.0;m[46]=45.0;m[47]=29.0;
+      m[48]=10.0;m[49]=58.0;m[50]=6.0;m[51]=54.0;m[52]=9.0;m[53]=57.0;m[54]=5.0;m[55]=53.0;
+      m[56]=42.0;m[57]=26.0;m[58]=38.0;m[59]=22.0;m[60]=41.0;m[61]=25.0;m[62]=37.0;m[63]=21.0;
+      int x = int(mod(c.x, 8.0));
+      int y = int(mod(c.y, 8.0));
+      int idx = y * 8 + x;
+      for(int i = 0; i < 64; i++){ if(i == idx) return m[i] / 64.0; }
+      return 0.0;
+    }
+    vec3 dither(vec2 fragPx, vec3 color){
+      vec2 sc = floor(fragPx / pixelSize);
+      float threshold = bayer(sc) - 0.25;
+      float step = 1.0 / (colorNum - 1.0);
+      color += threshold * step;
+      color = clamp(color - 0.2, 0.0, 1.0);
+      return floor(color * (colorNum - 1.0) + 0.5) / (colorNum - 1.0);
+    }
+
+    void main(){
+      /* 픽셀 단위로 양자화된 좌표 (도트 격자) */
+      vec2 fragPx = floor(gl_FragCoord.xy / pixelSize) * pixelSize;
+      vec2 uv = fragPx / resolution;
+      uv -= 0.5;
+      uv.x *= resolution.x / resolution.y;
+
+      /* ── 리플: 좌표 변위 + 발광 ── */
+      vec2 ruv = uv;
+      float glow = 0.0;
+      for(int i = 0; i < ${MAX}; i++){
+        vec4 r = ripples[i];
+        if(r.z < 0.0) continue;
+        float age = time - r.z;
+        if(age < 0.0 || age > 4.0) continue;
+        vec2 c = toShader(r.xy);
+        vec2 dir = uv - c;
+        float d = length(dir);
+        dir /= max(d, 1e-4);
+        float front = age * rippleSpeed;
+        float band  = exp(-pow((d - front) * 8.0, 2.0));
+        float env   = band * exp(-age * 1.6) * r.w * rippleStrength;
+        ruv  += dir * sin((d - front) * 30.0) * env * 0.06;
+        glow += env * 0.35;
+      }
+
+      float f = pattern(ruv) + glow;
+
+      if(mouseRadius > 0.0){
+        vec2 mNDC = toShader(mousePos);
+        float dist = length(uv - mNDC);
+        f -= 0.5 * (1.0 - smoothstep(0.0, mouseRadius, dist));
+      }
+
+      vec3 col = mix(vec3(0.0), waveColor, f);
+      col = dither(fragPx, col);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  function compile(type, src){
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+      console.error(gl.getShaderInfoLog(sh));
+    return sh;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, 'aPos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const U = n => gl.getUniformLocation(prog, n);
+  const uRes = U('resolution'), uTime = U('time'),
+        uMouse = U('mousePos'), uRipples = U('ripples');
+
+  gl.uniform3fv(U('waveColor'), CONFIG.waveColor);
+  gl.uniform1f(U('waveSpeed'), CONFIG.waveSpeed);
+  gl.uniform1f(U('waveFrequency'), CONFIG.waveFrequency);
+  gl.uniform1f(U('waveAmplitude'), CONFIG.waveAmplitude);
+  gl.uniform1f(U('colorNum'), CONFIG.colorNum);
+  gl.uniform1f(U('pixelSize'), CONFIG.pixelSize);
+  gl.uniform1f(U('mouseRadius'), CONFIG.mouseRadius);
+  gl.uniform1f(U('rippleSpeed'), CONFIG.rippleSpeed);
+  gl.uniform1f(U('rippleStrength'), CONFIG.rippleStrength);
+
+  let W, H, DPR;
+  function resize(){
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    canvas.width  = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+  }
+  resize();
+  addEventListener('resize', resize);
+
+  /* ── 리플 슬롯 (순환 재사용) ── */
+  const rip = new Float32Array(MAX * 4);
+  for(let i = 0; i < MAX; i++) rip[i*4 + 2] = -1;
+  let slot = 0;
+  const t0 = performance.now();
+  const nowSec = () => (performance.now() - t0) / 1000;
+
+  /* 화면 좌표(px) → 셰이더가 쓰는 디바이스 픽셀 좌표 */
+  function spawn(clientX, clientY, strength){
+    const i = slot * 4;
+    rip[i]     = clientX * DPR;
+    rip[i + 1] = clientY * DPR;
+    rip[i + 2] = nowSec();
+    rip[i + 3] = strength;
+    slot = (slot + 1) % MAX;
+  }
+
+  let lastX = -9999, lastY = -9999;
+  addEventListener('pointermove', e => {
+    if(CONFIG.mouseRadius > 0)
+      gl.uniform2f(uMouse, e.clientX * DPR, e.clientY * DPR);
+    if(Math.hypot(e.clientX - lastX, e.clientY - lastY) > 80){
+      spawn(e.clientX, e.clientY, 0.3);
+      lastX = e.clientX; lastY = e.clientY;
+    }
+  });
+  addEventListener('pointerdown', e => spawn(e.clientX, e.clientY, 1.0));
+  addEventListener('touchstart', e => {
+    const t = e.touches[0];
+    spawn(t.clientX, t.clientY, 1.0);
+  }, { passive:true });
+
+  /* 가끔 떨어지는 잔잔한 파장 */
+  let ambient = 1800, last = performance.now();
+  function loop(){
+    const now = performance.now();
+    const dt = now - last; last = now;
+    if(CONFIG.ambient){
+      ambient -= dt;
+      if(ambient <= 0){
+        spawn(Math.random() * W, H * (0.25 + Math.random() * 0.5), 0.18);
+        ambient = 2600 + Math.random() * 3400;
+      }
+    }
+    gl.uniform1f(uTime, nowSec());
+    gl.uniform4fv(uRipples, rip);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  /* 첫 인상 — 가운데에 파장 하나 */
+  setTimeout(() => spawn(W * 0.5, H * 0.5, 0.9), 800);
+})();
+</script>
+</body>
+</html>
